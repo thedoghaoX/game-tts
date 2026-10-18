@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>遊戲文字即時朗讀</title>
+<!-- v2 -->
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
@@ -145,6 +146,7 @@ async function ocrOnce() {
     }
   } catch (e) {
     console.error(e);
+    statusEl.textContent = '辨識失敗：' + (e.message || e);
   }
 }
 
@@ -159,7 +161,10 @@ async function start() {
       return;
     }
 
-    worker = await Tesseract.createWorker('chi_tra+eng', 1);
+    worker = await Tesseract.createWorker('chi_tra+eng', 1, {
+      logger: m => { if (!running) statusEl.textContent = '載入 OCR：' + m.status + (m.progress ? ' ' + Math.round(m.progress*100) + '%' : ''); },
+      errorHandler: e => showError('OCR ' + e)
+    });
     await worker.setParameters({
       tessedit_pageseg_mode: '6',
       preserve_interword_spaces: '0'
