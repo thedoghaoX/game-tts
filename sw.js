@@ -1,7 +1,8 @@
-// Cache the app shell and the Tesseract chi_tra payload.
-// Traineddata is also written to IndexedDB by Tesseract (cacheMethod: write).
+// Cache the app shell, the PP-OCRv5 model archives, and the plain WASM runtime.
+// Models and ort-wasm-simd-threaded.wasm are cache-first so the iPad only
+// downloads them once. The JSEP/WebGPU binary is never requested.
 
-const CACHE = 'game-tts-v3-1';
+const CACHE = 'game-tts-v4-paddle';
 
 const SHELL = [
   './',
@@ -11,16 +12,14 @@ const SHELL = [
   './js/ocr.js',
   './js/app.js',
   './js/test-page.js',
+  './js/chinese.js',
   './samples/manifest.json',
+  './vendor/opencc/full.js',
 ];
 
 function isModelRequest(url) {
-  if (url.hostname !== 'cdn.jsdelivr.net') return false;
-  return (
-    url.pathname.includes('/tesseract.js@')
-    || url.pathname.includes('/tesseract.js-core@')
-    || url.pathname.includes('/@tesseract.js-data/chi_tra/')
-  );
+  if (url.origin !== self.location.origin) return false;
+  return url.pathname.includes('/models/') || url.pathname.includes('/vendor/ort/');
 }
 
 self.addEventListener('install', (event) => {

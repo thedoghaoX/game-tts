@@ -1,28 +1,36 @@
-// Offline pipeline check: unit tests, then OCR on /samples.
+// Offline pipeline check, then PP-OCRv5 in headless Chrome on /samples.
 // Usage: npm test
 
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
+import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
-import { createWorker } from 'tesseract.js';
+import { toTraditional } from '../js/chinese.js';
 import {
   LIMITS,
   changeScore,
+  charAccuracy,
   coverSourceRect,
   createSession,
+  cropRGBA,
   decideSpeak,
+  detectDialogBox,
   downscaleGray,
   gateFrame,
+  meanLuma,
   normalizedSimilarity,
   preprocessRGBA,
-  scoreReading,
+  sourceRectToCoverPercent,
   simulateReading,
+  stabilizeDialogBox,
 } from '../js/pipeline.js';
-import { TESSACT_PARAMS } from '../js/ocr.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const failures = [];
+const PHOTO_GT = '我很期待大家的萬聖節裝扮！請各位務必要在31號當天以前準備好恐怖的服裝跟飾品喔！';
 
 function assert(cond, message) {
   if (!cond) failures.push(message);
@@ -33,12 +41,6 @@ function readPNG(file) {
   return { width: png.width, height: png.height, data: png.data };
 }
 
-function toPNG(image) {
-  const png = new PNG({ width: image.width, height: image.height });
-  png.data.set(image.data);
-  return PNG.sync.write(png);
-}
-
 function fill(width, height, rgba) {
   const data = new Uint8ClampedArray(width * height * 4);
   for (let i = 0; i < data.length; i += 4) {
@@ -46,6 +48,36 @@ function fill(width, height, rgba) {
     data[i + 1] = rgba[1];
     data[i + 2] = rgba[2];
     data[i + 3] = 255;
+  }
+  return { width, height, data };
+}
+
+function paintBox(textShift) {
+  const width = 220;
+  const height = 120;
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = 18;
+    data[i + 1] = 40;
+    data[i + 2] = 28;
+    data[i + 3] = 255;
+  }
+  for (let y = 40; y < 90; y++) {
+    for (let x = 30; x < 190; x++) {
+      const p = (y * width + x) * 4;
+      data[p] = 245;
+      data[p + 1] = 245;
+      data[p + 2] = 240;
+    }
+  }
+  const x0 = 50 + textShift;
+  for (let y = 58; y < 72; y++) {
+    for (let x = x0; x < x0 + 28; x++) {
+      const p = (y * width + x) * 4;
+      data[p] = 20;
+      data[p + 1] = 20;
+      data[p + 2] = 20;
+    }
   }
   return { width, height, data };
 }
@@ -69,6 +101,13 @@ function unitTests() {
   assert(next.speak, 'new line spoken');
   assert(!garbage.speak && garbage.reason === 'no-text', 'non-Chinese skipped');
   assert(!unsure.speak && unsure.reason === 'low-confidence', 'low confidence skipped');
+
+  const converted = toTraditional('我很期待大家的萬聖節装扮请各位务必要在31號当天以前準備好恐怖的服装跟饰品喔');
+  assert(converted.includes('裝扮') && converted.includes('請各位') && converted.includes('務必要'), `opencc cn->tw ${converted}`);
+  assert(converted.includes('當天') && converted.includes('服裝') && converted.includes('飾品'), `opencc leftovers ${converted}`);
+  assert(toTraditional(PHOTO_GT) === PHOTO_GT, 'traditional ground truth is unchanged by cn->tw');
+  const acc = charAccuracy(converted, PHOTO_GT);
+  assert(acc >= 0.8, `opencc string accuracy ${acc}`);
 
   const dark = fill(40, 20, [12, 16, 24]);
   for (let y = 6; y < 14; y++) {
@@ -124,75 +163,206 @@ function unitTests() {
   assert(full.sx + full.sw <= 1920, 'source rect stays inside the frame');
   const bottom = coverSourceRect(1920, 1080, 1024, 768, { x: 10, y: 64, w: 80, h: 28 });
   assert(bottom.sy > full.sh * 0.5, 'default crop maps to the lower part of the visible frame');
-}
+  const roundTrip = sourceRectToCoverPercent(1920, 1080, 1024, 768, bottom);
+  const back = coverSourceRect(1920, 1080, 1024, 768, roundTrip);
+  assert(Math.abs(back.sx - bottom.sx) <= 2 && Math.abs(back.sy - bottom.sy) <= 2, 'cover mapping round-trips');
 
-async function ocrSamples() {
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'samples/manifest.json'), 'utf8'));
-  const worker = await createWorker('chi_tra', 1, {
-    cachePath: path.join(root, '.cache/tess'),
-    cacheMethod: 'write',
-    gzip: true,
-    logger: (message) => {
-      if (message.status === 'loading language traineddata') {
-        process.stdout.write(`\rtraineddata ${Math.round((message.progress || 0) * 100)}%   `);
-      }
-    },
+  const before = paintBox(0);
+  const after = paintBox(70);
+  const fullDiff = changeScore(
+    downscaleGray(before.data, before.width, before.height),
+    downscaleGray(after.data, after.width, after.height),
+  ).diff;
+  const boxA = detectDialogBox(before.data, before.width, before.height);
+  const boxB = detectDialogBox(after.data, after.width, after.height);
+  assert(boxA && boxB, 'synthetic white dialog is found');
+  const cropA = cropRGBA(before.data, before.width, before.height, boxA);
+  const cropB = cropRGBA(after.data, after.width, after.height, boxB);
+  const cropDiff = changeScore(
+    downscaleGray(cropA.data, cropA.width, cropA.height),
+    downscaleGray(cropB.data, cropB.width, cropB.height),
+  ).diff;
+  console.log(`dialog change full ${fullDiff.toFixed(1)}% crop ${cropDiff.toFixed(1)}%`);
+  assert(cropDiff > fullDiff, 'change detection on the dialog is stronger than on the whole frame');
+  assert(cropDiff > LIMITS.CHANGE_THRESHOLD, `dialog crop should exceed the OCR threshold, diff ${cropDiff}`);
+  const held = stabilizeDialogBox(boxA, { ...boxA, x: boxA.x + 1 });
+  assert(held.x === boxA.x, 'a one-pixel nudge keeps the previous box');
+
+  const photo = jpeg.decode(fs.readFileSync(path.join(root, 'samples/ipad-tv-dialog.jpg')), {
+    useTArray: true,
+    formatAsRGBA: true,
   });
-  await worker.setParameters(TESSACT_PARAMS);
-
-  const recognized = [];
-  for (const sample of manifest.samples) {
-    const image = readPNG(path.join(root, 'samples', sample.file));
-    const prepared = preprocessRGBA(image.data, image.width, image.height);
-    const result = await worker.recognize(toPNG(prepared));
-    const text = result?.data?.text || '';
-    const confidence = Number(result?.data?.confidence ?? 0);
-    const score = scoreReading(sample.text, text, confidence);
-    recognized.push({ sample, text, confidence, score, image });
-    const sim = sample.text ? score.similarity.toFixed(2) : '—';
-    console.log(`\n${sample.id}\t${score.pass ? 'PASS' : 'FAIL'}\tsim=${sim}\tconf=${Math.round(confidence)}\t${score.got}`);
-    assert(score.pass, `${sample.id} accuracy failed: got "${score.got}" expected "${sample.text}"`);
+  const photoBox = detectDialogBox(photo.data, photo.width, photo.height);
+  assert(photoBox, 'iPad photo dialog box was not found');
+  if (photoBox) {
+    const ratio = (photoBox.w * photoBox.h) / (photo.width * photo.height);
+    const cropped = cropRGBA(photo.data, photo.width, photo.height, photoBox);
+    const luma = meanLuma(cropped.data, cropped.width, cropped.height);
+    console.log(`photo box ${photoBox.x},${photoBox.y} ${photoBox.w}x${photoBox.h} ratio ${ratio.toFixed(3)} luma ${luma.toFixed(1)}`);
+    assert(ratio > 0.02 && ratio < 0.25, `photo dialog area ratio ${ratio}`);
+    assert(photoBox.w / photoBox.h > 1.7 && photoBox.w / photoBox.h < 6.5, 'photo dialog aspect');
+    assert(luma > 140, `photo dialog should be the bright box, luma ${luma}`);
   }
 
-  const byId = new Map(recognized.map((item) => [item.sample.id, item]));
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'samples/manifest.json'), 'utf8'));
+  const byFile = new Map(manifest.samples.filter((sample) => sample.file.endsWith('.png')).map((sample) => [sample.id, readPNG(path.join(root, 'samples', sample.file))]));
+  const speckleDiff = changeScore(
+    downscaleGray(byFile.get('a').data, byFile.get('a').width, byFile.get('a').height),
+    downscaleGray(byFile.get('a-speckle').data, byFile.get('a-speckle').width, byFile.get('a-speckle').height),
+  ).diff;
+  console.log('speckle diff', speckleDiff.toFixed(2));
+  assert(speckleDiff <= LIMITS.CHANGE_THRESHOLD, `speckle should stay under the OCR threshold, diff ${speckleDiff}`);
+
   const shots = manifest.sequence.map((id) => {
-    const item = byId.get(id);
+    const image = byFile.get(id);
+    const sample = manifest.samples.find((item) => item.id === id);
     return {
       id,
-      gray: downscaleGray(item.image.data, item.image.width, item.image.height),
-      text: item.text,
-      confidence: item.confidence,
+      gray: downscaleGray(image.data, image.width, image.height),
+      text: sample.text,
+      confidence: 90,
     };
   });
   const reading = simulateReading(shots);
-  console.log('\nspeaks:', reading.speaks);
-  console.log('ocr runs:', reading.ocrRuns, 'rereads:', reading.rereads);
-  reading.events.forEach((event) => {
-    console.log(`  ${event.id}\t${event.reason}\t${event.text || ''}`);
-  });
-
-  const expected = manifest.expectedSpeaks;
-  const aligned = reading.speaks.length === expected.length
-    && reading.speaks.every((spoken, index) => normalizedSimilarity(spoken, expected[index]) > LIMITS.SIM_THRESHOLD);
+  const aligned = reading.speaks.length === manifest.expectedSpeaks.length
+    && reading.speaks.every((spoken, index) => normalizedSimilarity(spoken, manifest.expectedSpeaks[index]) > LIMITS.SIM_THRESHOLD);
   assert(reading.rereads === 0, `reread count ${reading.rereads}`);
-  assert(aligned, `speak sequence ${JSON.stringify(reading.speaks)} != ${JSON.stringify(expected)}`);
+  assert(aligned, `speak sequence ${JSON.stringify(reading.speaks)}`);
+}
 
-  const speckle = byId.get('a-speckle');
-  const speckleShot = simulateReading([
-    { id: 'a', gray: downscaleGray(byId.get('a').image.data, byId.get('a').image.width, byId.get('a').image.height), text: byId.get('a').text, confidence: 90 },
-    { id: 'a-speckle', gray: downscaleGray(speckle.image.data, speckle.image.width, speckle.image.height), text: speckle.text, confidence: 90 },
-  ]);
-  const speckleDiff = changeScore(
-    downscaleGray(byId.get('a').image.data, byId.get('a').image.width, byId.get('a').image.height),
-    downscaleGray(speckle.image.data, speckle.image.width, speckle.image.height),
-  ).diff;
-  console.log('speckle diff', speckleDiff.toFixed(2), 'shots', speckleShot.events.map((event) => event.reason).join(','));
-  assert(speckleDiff <= LIMITS.CHANGE_THRESHOLD, `speckle should stay under the OCR threshold, diff ${speckleDiff}`);
+function contentType(file) {
+  const ext = path.extname(file);
+  if (ext === '.html') return 'text/html; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'text/javascript; charset=utf-8';
+  if (ext === '.json') return 'application/json';
+  if (ext === '.wasm') return 'application/wasm';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.tar') return 'application/octet-stream';
+  return 'application/octet-stream';
+}
 
-  await worker.terminate();
-  const passed = recognized.filter((item) => item.score.pass).length;
-  console.log(`\naccuracy ${passed}/${recognized.length}`);
-  console.log(`rereads ${reading.rereads}`);
+function startServer() {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const rel = decodeURIComponent(url.pathname);
+    const file = path.join(root, rel === '/' ? 'index.html' : rel);
+    if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': contentType(file),
+      'Cache-Control': 'no-store',
+    });
+    fs.createReadStream(file).pipe(res);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function listenForPort(child) {
+  return new Promise((resolve, reject) => {
+    let buffered = '';
+    const timer = setTimeout(() => reject(new Error(`chrome did not open a debugging port\n${buffered}`)), 20000);
+    const onData = (chunk) => {
+      buffered += chunk.toString();
+      const match = buffered.match(/DevTools listening on ws:\/\/(?:127\.0\.0\.1|\[::1\]|localhost):(\d+)\//);
+      if (match) {
+        clearTimeout(timer);
+        child.stdout.off('data', onData);
+        child.stderr.off('data', onData);
+        resolve(Number(match[1]));
+      }
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+  });
+}
+
+async function chromeOcr(pageUrl) {
+  const profile = fs.mkdtempSync('/tmp/game-tts-chrome-');
+  const chrome = spawn('google-chrome', [
+    '--headless=new',
+    '--no-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--remote-debugging-port=0',
+    `--user-data-dir=${profile}`,
+    pageUrl,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const portPromise = listenForPort(chrome);
+  chrome.stdout.on('data', () => {});
+  const debugPort = await portPromise;
+  const list = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`)).json();
+  const page = list.find((entry) => entry.type === 'page' && entry.webSocketDebuggerUrl);
+  if (!page) throw new Error(`no chrome page in ${JSON.stringify(list)}`);
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', resolve);
+    ws.addEventListener('error', () => reject(new Error('devtools websocket failed')));
+  });
+  // Runtime.enable is sent after the helper below is defined.
+  let nextId = 0;
+  const waiters = new Map();
+  ws.addEventListener('message', (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.method === 'Runtime.exceptionThrown') {
+      console.error('browser exception:', msg.params?.exceptionDetails?.text, msg.params?.exceptionDetails?.exception?.description);
+    }
+    if (msg.method === 'Runtime.consoleAPICalled') {
+      const text = (msg.params?.args || []).map((arg) => arg.value || arg.description || '').join(' ');
+      if (text) console.log('console:', text);
+    }
+    if (msg.id && waiters.has(msg.id)) {
+      waiters.get(msg.id)(msg);
+      waiters.delete(msg.id);
+    }
+  });
+  function send(method, params) {
+    const id = ++nextId;
+    return new Promise((resolve) => {
+      waiters.set(id, resolve);
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+  await send('Runtime.enable');
+  const deadline = Date.now() + 180000;
+  let result = null;
+  let lastLog = '';
+  while (Date.now() < deadline) {
+    const reply = await send('Runtime.evaluate', {
+      expression: 'window.__RESULT || null',
+      returnByValue: true,
+    });
+    const value = reply.result?.result?.value;
+    if (value) {
+      result = value;
+      break;
+    }
+    const status = await send('Runtime.evaluate', {
+      expression: 'document.getElementById("status")?.textContent || ""',
+      returnByValue: true,
+    });
+    const text = status.result?.result?.value || '';
+    if (text && text !== lastLog) {
+      console.log('browser:', text);
+      lastLog = text;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  ws.close();
+  chrome.kill();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  try {
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+  } catch (err) {
+    console.warn('profile cleanup:', err.message);
+  }
+  if (!result) throw new Error('browser OCR timed out');
+  return result;
 }
 
 unitTests();
@@ -202,11 +372,38 @@ if (failures.length) {
 }
 console.log('unit tests passed');
 
+const server = await startServer();
+const port = server.address().port;
 try {
-  await ocrSamples();
+  const result = await chromeOcr(`http://127.0.0.1:${port}/test.html?auto=1`);
+  if (!result.ok) {
+    console.error(result.error || result);
+    if (result.stack) console.error(result.stack);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(result, null, 2));
+  assert(result.provider === 'wasm', `provider ${result.provider}`);
+  const photo = result.rows.find((row) => row.id === 'ipad-tv');
+  assert(photo, 'missing ipad-tv OCR row');
+  if (photo) {
+    console.log(`photo accuracy ${(photo.accuracy * 100).toFixed(1)}%`);
+    console.log(photo.text);
+    assert(photo.accuracy >= 0.8, `char accuracy ${photo.accuracy} for "${photo.text}"`);
+    assert(photo.pass, 'photo row did not pass');
+    const spoken = decideSpeak(createSession(), photo.text, photo.confidence);
+    assert(spoken.speak, `photo text should be read aloud, ${spoken.reason}`);
+  }
+  for (const row of result.rows) {
+    if (row.id === 'ipad-tv') continue;
+    assert(row.pass, `${row.id} accuracy failed: got "${row.text}"`);
+  }
+  assert(result.rereads === 0, `rereads ${result.rereads}`);
+  assert(result.aligned, `speak sequence ${JSON.stringify(result.speaks)}`);
 } catch (err) {
   console.error(err);
   process.exit(1);
+} finally {
+  server.close();
 }
 
 if (failures.length) {
