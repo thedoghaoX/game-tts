@@ -7,7 +7,8 @@
     {"id": "c", "file": "c-pages.png", "text": "把書頁翻開就能進入圖鑑的世界"},
     {"id": "d", "file": "d-hint.png", "text": "試著調查周圍的生物吧"},
     {"id": "e", "file": "e-two-lines.png", "text": "新的發現已記錄在圖鑑裡繼續探索這座小島吧"},
-    {"id": "empty", "file": "empty.png", "text": ""}
+    {"id": "empty", "file": "empty.png", "text": ""},
+    {"id": "ipad-tv", "file": "ipad-tv-dialog.jpg", "text": "我很期待大家的萬聖節裝扮！請各位務必要在31號當天以前準備好恐怖的服裝跟飾品喔！", "detect": true, "minCharAccuracy": 0.8}
   ],
   "sequence": ["a", "a", "a-bright", "a-speckle", "b", "b", "empty", "a"],
   "expectedSpeaks": ["耀西發現了一本神奇的書", "這座島上住著許多奇妙的生物"]

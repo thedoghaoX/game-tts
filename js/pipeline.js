@@ -454,3 +454,276 @@ export const GATE_REASON_ZH = {
   throttle: '略過辨識（省電，最多約每秒一次）',
   'stable-change': '辨識中',
 };
+
+const PUNCT_RE = /[\p{P}\p{S}]/u;
+
+// Accuracy ignores whitespace (via normalize) and punctuation. Simplified and
+// traditional characters stay distinct, so conversion has to happen first.
+export function stripForAccuracy(text) {
+  return [...normalize(text)].filter((ch) => !PUNCT_RE.test(ch)).join('');
+}
+
+export function charAccuracy(got, expected) {
+  const a = stripForAccuracy(got);
+  const b = stripForAccuracy(expected);
+  if (!b) return a ? 0 : 1;
+  return 1 - levenshtein(a, b) / [...b].length;
+}
+
+export function boxIou(a, b) {
+  if (!a || !b) return 0;
+  const ax2 = a.x + a.w;
+  const ay2 = a.y + a.h;
+  const bx2 = b.x + b.w;
+  const by2 = b.y + b.h;
+  const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y));
+  const inter = ix * iy;
+  const union = a.w * a.h + b.w * b.h - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// Keep the previous box when the new one barely moved, so change detection
+// does not see a shift of the same dialog as a new frame.
+export function stabilizeDialogBox(previous, next, minIou = 0.85) {
+  if (!next) return null;
+  if (!previous) return next;
+  if (boxIou(previous, next) >= minIou) return previous;
+  return next;
+}
+
+function dilateBinary(src, w, h, radius) {
+  const out = new Uint8Array(src.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let count = 0;
+    const span = radius * 2 + 1;
+    for (let x = 0; x < w + radius; x++) {
+      if (x < w) count += src[row + x];
+      const drop = x - span;
+      if (drop >= 0) count -= src[row + drop];
+      const dest = x - radius;
+      if (dest >= 0 && dest < w && count > 0) out[row + dest] = 1;
+    }
+  }
+  const vert = new Uint8Array(src.length);
+  for (let x = 0; x < w; x++) {
+    let count = 0;
+    const span = radius * 2 + 1;
+    for (let y = 0; y < h + radius; y++) {
+      if (y < h) count += out[y * w + x];
+      const drop = y - span;
+      if (drop >= 0) count -= out[drop * w + x];
+      const dest = y - radius;
+      if (dest >= 0 && dest < h && count > 0) vert[dest * w + x] = 1;
+    }
+  }
+  return vert;
+}
+
+function erodeBinary(src, w, h, radius) {
+  const out = new Uint8Array(src.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let count = 0;
+    const span = radius * 2 + 1;
+    for (let x = 0; x < w + radius; x++) {
+      if (x < w) count += src[row + x];
+      const drop = x - span;
+      if (drop >= 0) count -= src[row + drop];
+      const dest = x - radius;
+      if (dest >= 0 && dest < w) {
+        const left = Math.max(0, dest - radius);
+        const right = Math.min(w - 1, dest + radius);
+        if (count === right - left + 1) out[row + dest] = 1;
+      }
+    }
+  }
+  const vert = new Uint8Array(src.length);
+  for (let x = 0; x < w; x++) {
+    let count = 0;
+    const span = radius * 2 + 1;
+    for (let y = 0; y < h + radius; y++) {
+      if (y < h) count += out[y * w + x];
+      const drop = y - span;
+      if (drop >= 0) count -= out[drop * w + x];
+      const dest = y - radius;
+      if (dest >= 0 && dest < h) {
+        const top = Math.max(0, dest - radius);
+        const bottom = Math.min(h - 1, dest + radius);
+        if (count === bottom - top + 1) vert[dest * w + x] = 1;
+      }
+    }
+  }
+  return vert;
+}
+
+/**
+ * Find the large bright rounded dialog (white or cream, dark text).
+ * Coordinates are pixels of the input image. Returns null when nothing matches.
+ */
+export function detectDialogBox(src, width, height, opts = {}) {
+  if (!src || width < 8 || height < 8) return null;
+  const maxSide = opts.maxSide ?? 420;
+  const scale = Math.min(1, maxSide / Math.max(width, height));
+  const dw = Math.max(1, Math.round(width * scale));
+  const dh = Math.max(1, Math.round(height * scale));
+  const luma = new Uint8Array(dw * dh);
+  const mask = new Uint8Array(dw * dh);
+  const lumaMin = opts.lumaMin ?? 175;
+  const satMax = opts.satMax ?? 55;
+  for (let y = 0; y < dh; y++) {
+    const sy = Math.min(height - 1, Math.floor((y + 0.5) / scale));
+    for (let x = 0; x < dw; x++) {
+      const sx = Math.min(width - 1, Math.floor((x + 0.5) / scale));
+      const i = (sy * width + sx) * 4;
+      const r = src[i];
+      const g = src[i + 1];
+      const b = src[i + 2];
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      const yv = (0.299 * r + 0.587 * g + 0.114 * b) | 0;
+      const p = y * dw + x;
+      luma[p] = yv;
+      if (yv >= lumaMin && mx - mn <= satMax) mask[p] = 1;
+    }
+  }
+  const radius = opts.closeRadius ?? 2;
+  const closed = erodeBinary(dilateBinary(mask, dw, dh, radius), dw, dh, radius);
+  const seen = new Uint8Array(closed.length);
+  const stack = [];
+  let best = null;
+  const frameArea = dw * dh;
+  for (let start = 0; start < closed.length; start++) {
+    if (!closed[start] || seen[start]) continue;
+    let count = 0;
+    let minx = dw;
+    let miny = dh;
+    let maxx = 0;
+    let maxy = 0;
+    stack.push(start);
+    seen[start] = 1;
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % dw;
+      const y = (p / dw) | 0;
+      count += 1;
+      if (x < minx) minx = x;
+      if (y < miny) miny = y;
+      if (x > maxx) maxx = x;
+      if (y > maxy) maxy = y;
+      if (x > 0) {
+        const q = p - 1;
+        if (closed[q] && !seen[q]) { seen[q] = 1; stack.push(q); }
+      }
+      if (x + 1 < dw) {
+        const q = p + 1;
+        if (closed[q] && !seen[q]) { seen[q] = 1; stack.push(q); }
+      }
+      if (y > 0) {
+        const q = p - dw;
+        if (closed[q] && !seen[q]) { seen[q] = 1; stack.push(q); }
+      }
+      if (y + 1 < dh) {
+        const q = p + dw;
+        if (closed[q] && !seen[q]) { seen[q] = 1; stack.push(q); }
+      }
+    }
+    const bw = maxx - minx + 1;
+    const bh = maxy - miny + 1;
+    const area = bw * bh;
+    if (area < frameArea * 0.008 || area > frameArea * 0.42) continue;
+    const fill = count / area;
+    const aspect = bw / bh;
+    if (fill < 0.5 || aspect < 1.7 || aspect > 6.2) continue;
+    let sum = 0;
+    let dark = 0;
+    for (let y = miny; y <= maxy; y++) {
+      for (let x = minx; x <= maxx; x++) {
+        const v = luma[y * dw + x];
+        sum += v;
+      }
+    }
+    const mean = sum / area;
+    if (mean < 145) continue;
+    for (let y = miny; y <= maxy; y++) {
+      for (let x = minx; x <= maxx; x++) {
+        if (luma[y * dw + x] < mean - 45) dark += 1;
+      }
+    }
+    const darkRatio = dark / area;
+    if (darkRatio < 0.035 || darkRatio > 0.42) continue;
+    const score = area * fill * Math.min(darkRatio, 0.22);
+    if (!best || score > best.score) {
+      best = { minx, miny, maxx, maxy, score };
+    }
+  }
+  if (!best) return null;
+  let x0 = best.minx / scale;
+  let y0 = best.miny / scale;
+  let x1 = (best.maxx + 1) / scale;
+  let y1 = (best.maxy + 1) / scale;
+  const padX = (x1 - x0) * 0.035;
+  const padY = (y1 - y0) * 0.08;
+  x0 = Math.max(0, x0 - padX);
+  y0 = Math.max(0, y0 - padY);
+  x1 = Math.min(width, x1 + padX);
+  y1 = Math.min(height, y1 + padY);
+  const x = Math.floor(x0);
+  const y = Math.floor(y0);
+  const w = Math.max(1, Math.ceil(x1) - x);
+  const h = Math.max(1, Math.ceil(y1) - y);
+  return { x, y, w, h, score: best.score };
+}
+
+export function cropRGBA(src, width, height, box) {
+  const x = Math.max(0, Math.min(width - 1, Math.floor(box.x)));
+  const y = Math.max(0, Math.min(height - 1, Math.floor(box.y)));
+  const w = Math.max(1, Math.min(width - x, Math.floor(box.w)));
+  const h = Math.max(1, Math.min(height - y, Math.floor(box.h)));
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let row = 0; row < h; row++) {
+    const srcOff = ((y + row) * width + x) * 4;
+    data.set(src.subarray(srcOff, srcOff + w * 4), row * w * 4);
+  }
+  return { data, width: w, height: h };
+}
+
+export function meanLuma(src, width, height) {
+  if (!width || !height) return 0;
+  let sum = 0;
+  const n = width * height;
+  for (let i = 0, p = 0; p < n; i += 4, p++) {
+    sum += 0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2];
+  }
+  return sum / n;
+}
+
+// Inverse of coverSourceRect: source pixels -> percent of the <video> element.
+export function sourceRectToCoverPercent(videoWidth, videoHeight, elemWidth, elemHeight, rect) {
+  const videoAspect = videoWidth / videoHeight;
+  const elemAspect = elemWidth / elemHeight;
+  let dispW;
+  let dispH;
+  let offX;
+  let offY;
+  if (videoAspect > elemAspect) {
+    dispH = elemHeight;
+    dispW = elemHeight * videoAspect;
+    offX = (dispW - elemWidth) / 2;
+    offY = 0;
+  } else {
+    dispW = elemWidth;
+    dispH = elemWidth / videoAspect;
+    offX = 0;
+    offY = (dispH - elemHeight) / 2;
+  }
+  const scaleX = videoWidth / dispW;
+  const scaleY = videoHeight / dispH;
+  return {
+    x: ((rect.sx / scaleX) - offX) / elemWidth * 100,
+    y: ((rect.sy / scaleY) - offY) / elemHeight * 100,
+    w: (rect.sw / scaleX) / elemWidth * 100,
+    h: (rect.sh / scaleY) / elemHeight * 100,
+  };
+}

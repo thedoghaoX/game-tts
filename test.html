@@ -21,7 +21,7 @@ code { color: #d6ecff; }
 <main>
   <p><a href="./index.html">回到朗讀</a></p>
   <h1>離線測試</h1>
-  <p>不開相機、不送出圖片。用 <code>/samples</code> 的字幕圖跑同一套前處理、繁中 OCR、畫面穩定判斷和相似度去重，量準確率與重唸次數。</p>
+  <p>不開相機、不送出圖片。用 <code>/samples</code> 跑同一套對話框偵測、PP-OCRv5、簡轉繁、畫面穩定判斷和相似度去重。</p>
   <button id="run" type="button">執行測試</button>
   <div id="status">尚未執行</div>
   <div id="summary"></div>
@@ -34,7 +34,6 @@ code { color: #d6ecff; }
   <h2>連續畫面</h2>
   <ul id="sequence"></ul>
 </main>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script type="module" src="./js/test-page.js"></script>
 </body>
 </html>

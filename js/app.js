@@ -5,11 +5,14 @@ import {
   coverSourceRect,
   createSession,
   decideSpeak,
+  detectDialogBox,
   downscaleGray,
   gateFrame,
-  preprocessRGBA,
+  sourceRectToCoverPercent,
+  stabilizeDialogBox,
 } from './pipeline.js';
-import { createChiTraWorker } from './ocr.js';
+import { createOcrClient, MODEL_BYTES } from './ocr.js';
+import { toTraditional } from './chinese.js';
 
 const video = document.getElementById('video');
 const statusMain = document.getElementById('statusMain');
@@ -24,19 +27,21 @@ const thresholdInput = document.getElementById('threshold');
 const thresholdLabel = document.getElementById('thresholdValue');
 
 const CROP_KEY = 'game-tts-crop';
+const CROP_MODE_KEY = 'game-tts-crop-mode';
 const THRESH_KEY = 'game-tts-threshold';
 
-let worker = null;
+let client = null;
 let running = false;
 let loopTimer = null;
 let busy = false;
 let audioUnlocked = false;
-let sawLangDownload = false;
-let crop = loadCrop();
+let cropMode = localStorage.getItem(CROP_MODE_KEY) === 'manual' ? 'manual' : 'auto';
+let crop = cropMode === 'manual' ? loadCrop() : { ...DEFAULT_CROP };
+let dialogBox = null;
 let session = createSession();
 
 const captureCanvas = document.createElement('canvas');
-const ocrCanvas = document.createElement('canvas');
+const detectCanvas = document.createElement('canvas');
 
 function setStatus(main, detail, isError) {
   statusMain.textContent = main;
@@ -79,11 +84,18 @@ function round1(n) {
   return Math.round(n * 10) / 10;
 }
 
+function setCropLabel() {
+  const label = cropEl.querySelector('.label');
+  if (label) label.textContent = cropMode === 'manual' ? '手動裁切' : '自動對話框';
+}
+
 function updateCropUI() {
+  cropEl.style.display = 'block';
   cropEl.style.left = `${crop.x}%`;
   cropEl.style.top = `${crop.y}%`;
   cropEl.style.width = `${crop.w}%`;
   cropEl.style.height = `${crop.h}%`;
+  setCropLabel();
 }
 
 function loadThreshold() {
@@ -103,10 +115,18 @@ thresholdInput.addEventListener('input', () => {
   localStorage.setItem(THRESH_KEY, thresholdInput.value);
 });
 
-updateCropUI();
+if (cropMode === 'manual') updateCropUI();
+else cropEl.style.display = 'none';
+setCropLabel();
 
 let drag = null;
 cropEl.addEventListener('pointerdown', (event) => {
+  if (cropMode !== 'manual') {
+    cropMode = 'manual';
+    localStorage.setItem(CROP_MODE_KEY, 'manual');
+    saveCrop();
+    setCropLabel();
+  }
   const handle = event.target.closest('[data-handle]');
   drag = {
     mode: handle ? handle.dataset.handle : 'move',
@@ -163,9 +183,16 @@ function clamp(value, min, max) {
 }
 
 resetCropBtn.addEventListener('click', () => {
+  cropMode = 'auto';
+  localStorage.setItem(CROP_MODE_KEY, 'auto');
+  dialogBox = null;
+  session.prevGray = null;
+  session.pendingChange = false;
+  session.frameStable = 0;
   crop = { ...DEFAULT_CROP };
-  updateCropUI();
-  saveCrop();
+  cropEl.style.display = 'none';
+  setCropLabel();
+  setStatus(statusMain.textContent, '已改回自動尋找白色對話框');
 });
 
 clearSpokenBtn.addEventListener('click', () => {
@@ -236,27 +263,79 @@ function speak(text) {
   lastEl.textContent = `剛唸：${text}`;
 }
 
-function captureCrop() {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!vw || !vh) return null;
-  const rect = coverSourceRect(vw, vh, video.clientWidth, video.clientHeight, crop);
-  captureCanvas.width = rect.sw;
-  captureCanvas.height = rect.sh;
+function grab(sx, sy, sw, sh, dw, dh) {
+  captureCanvas.width = dw;
+  captureCanvas.height = dh;
   const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(video, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, rect.sw, rect.sh);
-  return ctx.getImageData(0, 0, rect.sw, rect.sh);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+  return ctx.getImageData(0, 0, dw, dh);
+}
+
+function findDialog(vw, vh) {
+  const detectW = 480;
+  const detectH = Math.max(1, Math.round(vh * (detectW / vw)));
+  detectCanvas.width = detectW;
+  detectCanvas.height = detectH;
+  const ctx = detectCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, vw, vh, 0, 0, detectW, detectH);
+  const small = ctx.getImageData(0, 0, detectW, detectH);
+  const found = detectDialogBox(small.data, small.width, small.height);
+  if (!found) return null;
+  const sx = Math.max(0, Math.round(found.x / detectW * vw));
+  const sy = Math.max(0, Math.round(found.y / detectH * vh));
+  const sw = Math.max(1, Math.min(vw - sx, Math.round(found.w / detectW * vw)));
+  const sh = Math.max(1, Math.min(vh - sy, Math.round(found.h / detectH * vh)));
+  return { x: sx, y: sy, w: sw, h: sh };
+}
+
+function showSourceRect(vw, vh, rect) {
+  const percent = sourceRectToCoverPercent(vw, vh, video.clientWidth, video.clientHeight, {
+    sx: rect.x,
+    sy: rect.y,
+    sw: rect.w,
+    sh: rect.h,
+  });
+  crop = percent;
+  updateCropUI();
 }
 
 async function tick() {
-  if (!running || !worker || busy) return;
-  const image = captureCrop();
-  if (!image) return;
+  if (!running || !client || busy) return;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  let rect;
+  if (cropMode === 'manual') {
+    const mapped = coverSourceRect(vw, vh, video.clientWidth, video.clientHeight, crop);
+    rect = { x: mapped.sx, y: mapped.sy, w: mapped.sw, h: mapped.sh };
+  } else {
+    const found = findDialog(vw, vh);
+    const stable = stabilizeDialogBox(dialogBox, found);
+    dialogBox = stable;
+    if (!stable) {
+      crop = { ...DEFAULT_CROP };
+      updateCropUI();
+      session.prevGray = null;
+      session.pendingChange = false;
+      session.frameStable = 0;
+      setStatus('找不到對話框', '鏡頭對準白色對話框，或拖曳藍框改成手動');
+      return;
+    }
+    rect = { x: stable.x, y: stable.y, w: stable.w, h: stable.h };
+    showSourceRect(vw, vh, rect);
+  }
+
+  const maxW = 1280;
+  const scale = rect.w > maxW ? maxW / rect.w : 1;
+  const dw = Math.max(1, Math.round(rect.w * scale));
+  const dh = Math.max(1, Math.round(rect.h * scale));
+  const image = grab(rect.x, rect.y, rect.w, rect.h, dw, dh);
   const gray = downscaleGray(image.data, image.width, image.height);
   const gate = gateFrame(session, gray, performance.now(), {
     changeThreshold: currentThreshold(),
   });
-    const diffText = gate.diff == null ? '' : `差異 ${gate.diff.toFixed(1)}%`;
+  const diffText = gate.diff == null ? '' : `差異 ${gate.diff.toFixed(1)}%`;
   if (!gate.runOcr) {
     setStatus(GATE_REASON_ZH[gate.reason] || gate.reason, diffText);
     return;
@@ -265,18 +344,10 @@ async function tick() {
   busy = true;
   setStatus('辨識中…', diffText);
   try {
-    const prepared = preprocessRGBA(image.data, image.width, image.height);
-    ocrCanvas.width = prepared.width;
-    ocrCanvas.height = prepared.height;
-    ocrCanvas.getContext('2d').putImageData(
-      new ImageData(prepared.data, prepared.width, prepared.height),
-      0,
-      0,
-    );
-    const result = await worker.recognize(ocrCanvas);
-    const text = result?.data?.text || '';
-    const confidence = Number(result?.data?.confidence ?? 0);
-    const decision = decideSpeak(session, text, confidence);
+    const result = await client.recognize(new ImageData(image.data, image.width, image.height));
+    const traditional = toTraditional(result.text || '');
+    const confidence = Number(result.confidence || 0);
+    const decision = decideSpeak(session, traditional, confidence);
     const seen = decision.text || '（無文字）';
     if (decision.speak) {
       speak(decision.text);
@@ -343,25 +414,25 @@ async function openCamera() {
   }
 }
 
+function modelMegabytes() {
+  return ((MODEL_BYTES.det + MODEL_BYTES.rec) / (1024 * 1024)).toFixed(1);
+}
+
 async function ensureWorker() {
-  if (worker) return;
-  sawLangDownload = false;
-  setStatus('載入繁中字庫…', '第一次會下載，之後從瀏覽器快取讀取');
-  worker = await createChiTraWorker({
-    logger: (message) => {
-      if (message.status === 'loading language traineddata' && message.progress > 0 && message.progress < 1) {
-        sawLangDownload = true;
-      }
-      if (!running) {
-        const pct = message.progress != null ? ` ${Math.round(message.progress * 100)}%` : '';
-        setStatus(`載入 OCR：${message.status}${pct}`, sawLangDownload ? '正在下載繁中字庫' : '檢查快取');
-      }
-    },
-    errorHandler: (err) => {
-      const text = typeof err === 'string' ? err : (err?.message || String(err));
-      setStatus('OCR 錯誤', text, true);
-    },
-  });
+  if (client) return;
+  setStatus('載入辨識模型…', `PP-OCRv5 約 ${modelMegabytes()}MB，第一次下載，之後從快取讀取`);
+  client = createOcrClient();
+  try {
+    const ready = await client.ready;
+    const provider = ready.summary?.detProvider || '';
+    if (provider && provider !== 'wasm') {
+      throw new Error(`需要 plain WASM，目前是 ${provider}`);
+    }
+  } catch (err) {
+    client.terminate();
+    client = null;
+    throw err;
+  }
 }
 
 async function start() {
@@ -369,7 +440,7 @@ async function start() {
   toggleBtn.disabled = true;
   try {
     await ensureWorker();
-    setStatus(sawLangDownload ? '字庫已下載並寫入快取' : '字庫來自快取', '正在開啟相機…');
+    setStatus('模型已就緒', '正在開啟相機…');
     const stream = await openCamera();
     video.srcObject = stream;
     video.playsInline = true;
@@ -380,7 +451,7 @@ async function start() {
     session.spoken = [];
     toggleBtn.textContent = '停止';
     toggleBtn.classList.add('stop');
-    setStatus('已開始', audioUnlocked ? '藍色框對準字幕，新的字會自動唸' : '建議先點「開啟聲音」，否則 iPad 可能不會出聲');
+    setStatus('已開始', audioUnlocked ? '會自動框住白色對話框，新的字會自動唸' : '建議先點「開啟聲音」，否則 iPad 可能不會出聲');
     loop();
   } catch (err) {
     setStatus('無法開始', cameraErrorMessage(err), true);
@@ -401,7 +472,7 @@ function stop() {
   if (window.speechSynthesis) window.speechSynthesis.cancel();
   toggleBtn.textContent = '開始掃描';
   toggleBtn.classList.remove('stop');
-  setStatus('已停止', '字庫仍留在快取，下次不用重新下載');
+  setStatus('已停止', '模型仍留在快取，下次不用重新下載');
 }
 
 toggleBtn.addEventListener('click', () => {
@@ -415,6 +486,6 @@ toggleBtn.addEventListener('click', () => {
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(() => {
-    // Cache is optional; IndexedDB inside Tesseract still covers the traineddata.
+    // Cache is optional; a failed registration still leaves the live fetch path.
   });
 }
