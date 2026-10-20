@@ -2,214 +2,131 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <title>遊戲文字即時朗讀</title>
-<!-- v2 -->
 <style>
 * { box-sizing: border-box; }
-body { margin: 0; background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
-#video { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; background:#111; }
-.overlay { position: fixed; z-index: 10; }
+html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+#video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #111; }
+.overlay { position: fixed; z-index: 30; }
+#top {
+  top: calc(8px + env(safe-area-inset-top));
+  left: 10px; right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+#top button, #top label, #top a { pointer-events: auto; }
 #status {
-  top: 12px; left: 12px; right: 12px;
-  background: rgba(0,0,0,0.8);
-  padding: 12px 14px;
+  background: rgba(0,0,0,0.82);
+  padding: 10px 12px;
   border-radius: 14px;
   font-size: 16px;
-  line-height: 1.4;
+  line-height: 1.35;
 }
-#last { top: 110px; left: 12px; right: 12px; background: rgba(0,0,0,0.6); padding: 6px 14px; border-radius: 10px; color: #4ade80; font-size: 15px; word-break: break-all; }
-#controls { bottom: 20px; left: 50%; transform: translateX(-50%); }
-button {
-  padding: 16px 32px; font-size: 20px; font-weight: 600;
-  border-radius: 40px; border: none; background: #0a84ff; color: #fff; min-width: 140px;
+#statusDetail { margin-top: 4px; color: #c7c7cc; font-size: 14px; word-break: break-all; }
+#statusDetail.error { color: #ff6b6b; }
+#last { margin-top: 4px; color: #4ade80; font-size: 16px; word-break: break-all; }
+#controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
 }
+button, .linkbtn {
+  min-height: 48px;
+  padding: 12px 16px;
+  font-size: 17px;
+  font-weight: 600;
+  border-radius: 999px;
+  border: none;
+  background: #0a84ff;
+  color: #fff;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+button.secondary, .linkbtn { background: #3a3a3c; }
 button.stop { background: #ff3b30; }
-#error { color: #ff6b6b; margin-top: 8px; }
+button:disabled { opacity: 0.6; }
+label.threshold {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(0,0,0,0.72);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+label.threshold input { width: 110px; }
+#crop {
+  position: fixed;
+  border: 3px solid #0a84ff;
+  background: rgba(10,132,255,0.15);
+  touch-action: none;
+  z-index: 20;
+  cursor: move;
+}
+#crop .label {
+  position: absolute;
+  left: 8px; top: 6px;
+  font-size: 13px;
+  color: #fff;
+  background: rgba(0,0,0,0.55);
+  padding: 2px 6px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+.handle {
+  position: absolute;
+  width: 28px; height: 28px;
+  background: #fff;
+  border: 3px solid #0a84ff;
+  border-radius: 50%;
+  touch-action: none;
+}
+.handle.nw { left: -14px; top: -14px; }
+.handle.ne { right: -14px; top: -14px; }
+.handle.sw { left: -14px; bottom: -14px; }
+.handle.se { right: -14px; bottom: -14px; }
+.handle.n { left: 50%; top: -14px; margin-left: -14px; }
+.handle.s { left: 50%; bottom: -14px; margin-left: -14px; }
+.handle.e { right: -14px; top: 50%; margin-top: -14px; }
+.handle.w { left: -14px; top: 50%; margin-top: -14px; }
 </style>
 </head>
 <body>
 <video id="video" autoplay playsinline muted></video>
-<div id="status" class="overlay">點下方按鈕開始</div>
-<div id="last" class="overlay"></div>
-<div id="controls" class="overlay">
-  <button id="toggle">開始掃描</button>
+<div id="crop">
+  <span class="label">拖曳移動，拉圓點調整大小</span>
+  <i class="handle nw" data-handle="nw"></i>
+  <i class="handle n" data-handle="n"></i>
+  <i class="handle ne" data-handle="ne"></i>
+  <i class="handle e" data-handle="e"></i>
+  <i class="handle se" data-handle="se"></i>
+  <i class="handle s" data-handle="s"></i>
+  <i class="handle sw" data-handle="sw"></i>
+  <i class="handle w" data-handle="w"></i>
 </div>
-
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-<script>
-const video = document.getElementById('video');
-const statusEl = document.getElementById('status');
-const lastEl = document.getElementById('last');
-const toggleBtn = document.getElementById('toggle');
-
-let worker = null;
-let running = false;
-let intervalId = null;
-let lastSpoken = '';
-let stableText = '';
-let stableCount = 0;
-let emptyCount = 0;
-let busy = false;
-
-const STABLE_NEED = 2;
-const EMPTY_RESET = 4;
-const POLL_MS = 900;
-const MIN_LEN = 3;
-const SIM_THRESHOLD = 0.65;
-
-function showError(msg) {
-  statusEl.innerHTML = '錯誤：' + msg + '<div id="error">請確認是用 Safari 打開 HTTPS 網址，並允許相機</div>';
-}
-
-function normalize(t) {
-  return (t || '').replace(/[\s\n\r\t]+/g, '').trim();
-}
-
-function levenshtein(a, b) {
-  const m = [];
-  for (let i = 0; i <= b.length; i++) m[i] = [i];
-  for (let j = 0; j <= a.length; j++) m[0][j] = j;
-  for (let i = 1; i <= b.length; i++) {
-    for (let j = 1; j <= a.length; j++) {
-      m[i][j] = b.charAt(i - 1) === a.charAt(j - 1)
-        ? m[i - 1][j - 1]
-        : Math.min(m[i - 1][j - 1] + 1, m[i][j - 1] + 1, m[i - 1][j] + 1);
-    }
-  }
-  return m[b.length][a.length];
-}
-
-function similarity(a, b) {
-  if (!a || !b) return 0;
-  const longer = a.length > b.length ? a : b;
-  const shorter = a.length > b.length ? b : a;
-  if (longer.length === 0) return 1;
-  return (longer.length - levenshtein(longer, shorter)) / longer.length;
-}
-
-function speak(text) {
-  if (!text || similarity(text, lastSpoken) >= SIM_THRESHOLD) return;
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'zh-TW';
-  const voices = speechSynthesis.getVoices();
-  const zh = voices.find(v => v.lang.startsWith('zh-TW') || v.lang.startsWith('zh'));
-  if (zh) u.voice = zh;
-  u.rate = 1.05;
-  speechSynthesis.speak(u);
-  lastSpoken = text;
-  lastEl.textContent = '剛唸：' + text;
-}
-
-async function processFrame() {
-  if (!running || !worker || busy) return;
-  busy = true;
-  try { await ocrOnce(); } finally { busy = false; }
-}
-
-async function ocrOnce() {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (!w || !h) return;
-
-  const cropW = Math.floor(w * 0.75);
-  const cropH = Math.floor(h * 0.4);
-  const sx = Math.floor((w - cropW) / 2);
-  const sy = Math.floor(h * 0.4);
-  canvas.width = cropW;
-  canvas.height = cropH;
-  ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, cropW, cropH);
-
-  try {
-    const { data: { text } } = await worker.recognize(canvas);
-    const norm = normalize(text);
-    statusEl.textContent = '掃描中… 看到：' + (norm || '（無文字）');
-
-    if (norm.length < MIN_LEN) {
-      emptyCount++;
-      if (emptyCount >= EMPTY_RESET) {
-        lastSpoken = '';
-        stableText = '';
-        stableCount = 0;
-      }
-      return;
-    }
-    emptyCount = 0;
-    if (norm === stableText) stableCount++;
-    else { stableText = norm; stableCount = 1; }
-
-    if (stableCount >= STABLE_NEED && similarity(norm, lastSpoken) < SIM_THRESHOLD) {
-      speak(norm);
-    }
-  } catch (e) {
-    console.error(e);
-    statusEl.textContent = '辨識失敗：' + (e.message || e);
-  }
-}
-
-async function start() {
-  toggleBtn.disabled = true;
-  try { const u0 = new SpeechSynthesisUtterance(' '); u0.volume = 0; speechSynthesis.speak(u0); } catch (e) {}
-  statusEl.textContent = '載入 OCR…';
-  try {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      showError('此環境不支援相機');
-      toggleBtn.disabled = false;
-      return;
-    }
-
-    worker = await Tesseract.createWorker('chi_tra+eng', 1, {
-      logger: m => { if (!running) statusEl.textContent = '載入 OCR：' + m.status + (m.progress ? ' ' + Math.round(m.progress*100) + '%' : ''); },
-      errorHandler: e => showError('OCR ' + e)
-    });
-    await worker.setParameters({
-      tessedit_pageseg_mode: '6',
-      preserve_interword_spaces: '0'
-    });
-
-    statusEl.textContent = '正在開啟相機…';
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false
-    });
-
-    video.srcObject = stream;
-    // iOS 需要這幾個屬性
-    video.setAttribute('playsinline', '');
-    video.setAttribute('muted', '');
-    video.setAttribute('autoplay', '');
-    await video.play();
-
-    running = true;
-    intervalId = setInterval(processFrame, POLL_MS);
-    toggleBtn.textContent = '停止';
-    toggleBtn.classList.add('stop');
-    statusEl.textContent = '已開始（只唸新文字）';
-  } catch (err) {
-    console.error(err);
-    showError(err.name + ': ' + (err.message || '未知錯誤'));
-  }
-  toggleBtn.disabled = false;
-}
-
-function stop() {
-  running = false;
-  if (intervalId) clearInterval(intervalId);
-  if (worker) { worker.terminate(); worker = null; }
-  if (video.srcObject) {
-    video.srcObject.getTracks().forEach(t => t.stop());
-    video.srcObject = null;
-  }
-  statusEl.textContent = '已停止';
-  toggleBtn.textContent = '開始掃描';
-  toggleBtn.classList.remove('stop');
-}
-
-toggleBtn.onclick = () => running ? stop() : start();
-speechSynthesis.getVoices();
-</script>
+<div id="top" class="overlay">
+<div id="status">
+  <div id="statusMain">點「開啟聲音」，再按「開始掃描」</div>
+  <div id="statusDetail">裁切框預設在畫面下方，位置會記住</div>
+  <div id="last"></div>
+</div>
+<div id="controls">
+  <button id="unlock" type="button">開啟聲音</button>
+  <button id="toggle" type="button">開始掃描</button>
+  <button id="resetCrop" class="secondary" type="button">重置裁切</button>
+  <button id="clearSpoken" class="secondary" type="button">清除已唸</button>
+  <label class="threshold" title="裁切範圍裡有多少比例的畫面變了才重新辨識。電視閃爍就調高。">變化門檻 <input id="threshold" type="range" min="1" max="20" step="1" value="3"> <span id="thresholdValue">3</span>%</label>
+  <a class="linkbtn" href="./test.html">離線測試</a>
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script type="module" src="./js/app.js"></script>
 </body>
 </html>

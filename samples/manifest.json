@@ -1,0 +1,14 @@
+{
+  "samples": [
+    {"id": "a", "file": "a-discover.png", "text": "耀西發現了一本神奇的書"},
+    {"id": "a-bright", "file": "a-discover-bright.png", "text": "耀西發現了一本神奇的書"},
+    {"id": "a-speckle", "file": "a-discover-speckle.png", "text": "耀西發現了一本神奇的書"},
+    {"id": "b", "file": "b-island.png", "text": "這座島上住著許多奇妙的生物"},
+    {"id": "c", "file": "c-pages.png", "text": "把書頁翻開就能進入圖鑑的世界"},
+    {"id": "d", "file": "d-hint.png", "text": "試著調查周圍的生物吧"},
+    {"id": "e", "file": "e-two-lines.png", "text": "新的發現已記錄在圖鑑裡繼續探索這座小島吧"},
+    {"id": "empty", "file": "empty.png", "text": ""}
+  ],
+  "sequence": ["a", "a", "a-bright", "a-speckle", "b", "b", "empty", "a"],
+  "expectedSpeaks": ["耀西發現了一本神奇的書", "這座島上住著許多奇妙的生物"]
+}

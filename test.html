@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>離線辨識測試</title>
+<style>
+body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #111; color: #f2f2f7; }
+main { max-width: 960px; margin: 0 auto; padding: 20px 16px 48px; }
+a { color: #64b5ff; }
+button { min-height: 48px; padding: 12px 18px; border: none; border-radius: 999px; background: #0a84ff; color: #fff; font-size: 17px; font-weight: 600; }
+#status { margin: 16px 0; line-height: 1.4; }
+#summary { white-space: pre-wrap; background: #1c1c1e; padding: 12px 14px; border-radius: 12px; }
+table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px; }
+th, td { border-bottom: 1px solid #333; padding: 8px 6px; text-align: left; vertical-align: top; }
+th { color: #aaa; font-weight: 600; }
+code { color: #d6ecff; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="./index.html">回到朗讀</a></p>
+  <h1>離線測試</h1>
+  <p>不開相機、不送出圖片。用 <code>/samples</code> 的字幕圖跑同一套前處理、繁中 OCR、畫面穩定判斷和相似度去重，量準確率與重唸次數。</p>
+  <button id="run" type="button">執行測試</button>
+  <div id="status">尚未執行</div>
+  <div id="summary"></div>
+  <table>
+    <thead>
+      <tr><th>樣本</th><th>預期</th><th>辨識</th><th>相似度</th><th>信心</th><th>結果</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <h2>連續畫面</h2>
+  <ul id="sequence"></ul>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script type="module" src="./js/test-page.js"></script>
+</body>
+</html>

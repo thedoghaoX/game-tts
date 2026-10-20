@@ -1,0 +1,13 @@
+{
+  "name": "game-tts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/run.mjs",
+    "samples": "python3 test/make-samples.py"
+  },
+  "devDependencies": {
+    "pngjs": "^7.0.0",
+    "tesseract.js": "5.1.1"
+  }
+}
